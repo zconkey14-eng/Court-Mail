@@ -1,11 +1,13 @@
 import csv
+import os
 import re
+import sys
+import tempfile
 from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill
 from pypdf import PdfReader, PdfWriter
-import fitz  # PyMuPDF - renders pages to images for OCR
-import pytesseract
+import ocrmypdf
 
 # Folder Settings
 
@@ -17,15 +19,20 @@ OUTPUT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Output")
 
 XAA_CSV = Path(r"F:\Reports\X-Reports\xaa.csv")
 
-# Path to the Tesseract OCR executable. Only needed if Tesseract is not
-# already on the system PATH. Install from:
-# https://github.com/UB-Mannheim/tesseract/wiki
-# then set this to wherever it installed, e.g.:
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# OCRmyPDF shells out to Tesseract (and Ghostscript) by looking them up on
+# the system PATH - it has no "tesseract_cmd" style override like
+# pytesseract does. If either program was installed somewhere that did not
+# add itself to PATH, list the folder containing the .exe here and it will
+# be added to PATH before OCR runs. Leave the list empty if both installers
+# already added themselves to PATH (check with "tesseract --version" and
+# "gswin64c --version" in a terminal).
+EXTRA_PATH_FOLDERS = [
+    r"C:\Users\ZEC\AppData\Local\Tesseract-OCR",
+]
 
-# Resolution used when rendering a page to an image for OCR. Higher is more
-# accurate but slower. 300 is a good balance for scanned court notices.
-OCR_DPI = 300
+for folder in EXTRA_PATH_FOLDERS:
+    if folder and folder not in os.environ["PATH"]:
+        os.environ["PATH"] = folder + os.pathsep + os.environ["PATH"]
 
 # Used when a case number has no match in xaa.csv
 MANUAL = "MANUAL"
@@ -275,34 +282,43 @@ def clean_text(text):
     return text.strip()
 
 
-# Run OCR on a single page. This is what replaces the separate Adobe OCR
-# pass - the page is rendered to an image in memory and read with
-# Tesseract, on the fly.
+# Run OCRmyPDF on a whole PDF, adding a text layer to every page. This is
+# what replaces the separate Adobe OCR pass - the OCR'd copy is written to
+# a temp file and everything downstream (classification, saving pages)
+# reads from that copy instead of the raw scan.
 
-def ocr_page_text(pdf_document, page_number):
+def ocr_pdf(pdf_path):
+
+    temp_file = tempfile.NamedTemporaryFile(
+        suffix=".pdf",
+        delete=False
+    )
+    temp_file.close()
+
+    ocr_output_path = Path(temp_file.name)
+
+    ocrmypdf.ocr(
+        pdf_path,
+        ocr_output_path,
+        force_ocr=True,
+        deskew=True,
+        progress_bar=False
+    )
+
+    return ocr_output_path
+
+
+def extract_page_text(page):
 
     try:
 
-        page = pdf_document[page_number]
-
-        zoom = OCR_DPI / 72
-        matrix = fitz.Matrix(zoom, zoom)
-        pixmap = page.get_pixmap(matrix=matrix)
-
-        image_bytes = pixmap.tobytes("png")
-
-        import io
-        from PIL import Image
-
-        image = Image.open(io.BytesIO(image_bytes))
-
-        text = pytesseract.image_to_string(image)
+        text = page.extract_text()
 
         return clean_text(text) if text else ""
 
     except Exception as error:
 
-        print(f"OCR failed on page {page_number + 1}: {error}")
+        print(f"Could not read page: {error}")
 
         return ""
 
@@ -913,8 +929,11 @@ def process_pdf(
     print("=" * 60)
     print(f"Processing: {pdf_path.name}")
 
-    reader = PdfReader(pdf_path)
-    ocr_document = fitz.open(pdf_path)
+    print("Running OCR...")
+
+    ocr_output_path = ocr_pdf(pdf_path)
+
+    reader = PdfReader(ocr_output_path)
 
     total_pages = len(reader.pages)
 
@@ -932,9 +951,7 @@ def process_pdf(
             f"{page_number}/{total_pages}"
         )
 
-        # Raw scans have no text layer, so every page is OCR'd directly -
-        # this is what replaces the separate Adobe OCR pass
-        text = ocr_page_text(ocr_document, page_number - 1)
+        text = extract_page_text(page)
 
         status = "Sorted"
         destination = "Sorted"
@@ -1156,7 +1173,10 @@ def process_pdf(
         print(f"Saved to: {output_path}")
         print()
 
-    ocr_document.close()
+    # The OCR'd copy was only needed to read and save pages from -
+    # remove it now that this PDF is fully processed
+    reader = None
+    ocr_output_path.unlink(missing_ok=True)
 
 # Create Excel Report
 
