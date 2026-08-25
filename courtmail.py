@@ -4,6 +4,8 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill
 from pypdf import PdfReader, PdfWriter
+import fitz  # PyMuPDF - renders pages to images for OCR
+import pytesseract
 
 # Folder Settings
 
@@ -14,6 +16,16 @@ OUTPUT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Output")
 # Columns used: "case" (court case number) and "file" (our file / account number)
 
 XAA_CSV = Path(r"F:\Reports\X-Reports\xaa.csv")
+
+# Path to the Tesseract OCR executable. Only needed if Tesseract is not
+# already on the system PATH. Install from:
+# https://github.com/UB-Mannheim/tesseract/wiki
+# then set this to wherever it installed, e.g.:
+# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# Resolution used when rendering a page to an image for OCR. Higher is more
+# accurate but slower. 300 is a good balance for scanned court notices.
+OCR_DPI = 300
 
 # Used when a case number has no match in xaa.csv
 MANUAL = "MANUAL"
@@ -263,25 +275,37 @@ def clean_text(text):
     return text.strip()
 
 
-# Read Page
+# Run OCR on a single page. This is what replaces the separate Adobe OCR
+# pass - the page is rendered to an image in memory and read with
+# Tesseract, on the fly.
 
-def extract_page_text(page):
+def ocr_page_text(pdf_document, page_number):
 
     try:
 
-        text = page.extract_text()
+        page = pdf_document[page_number]
 
-        if text:
-            return clean_text(text)
+        zoom = OCR_DPI / 72
+        matrix = fitz.Matrix(zoom, zoom)
+        pixmap = page.get_pixmap(matrix=matrix)
 
-        else:
-            return ""
+        image_bytes = pixmap.tobytes("png")
+
+        import io
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(image_bytes))
+
+        text = pytesseract.image_to_string(image)
+
+        return clean_text(text) if text else ""
 
     except Exception as error:
 
-        print(f"Could not read page: {error}")
+        print(f"OCR failed on page {page_number + 1}: {error}")
 
         return ""
+
 
 # Page Classification
 
@@ -890,6 +914,7 @@ def process_pdf(
     print(f"Processing: {pdf_path.name}")
 
     reader = PdfReader(pdf_path)
+    ocr_document = fitz.open(pdf_path)
 
     total_pages = len(reader.pages)
 
@@ -907,7 +932,9 @@ def process_pdf(
             f"{page_number}/{total_pages}"
         )
 
-        text = extract_page_text(page)
+        # Raw scans have no text layer, so every page is OCR'd directly -
+        # this is what replaces the separate Adobe OCR pass
+        text = ocr_page_text(ocr_document, page_number - 1)
 
         status = "Sorted"
         destination = "Sorted"
@@ -1128,6 +1155,8 @@ def process_pdf(
         print(f"Matched PDF Text: {matched_context or 'None'}")
         print(f"Saved to: {output_path}")
         print()
+
+    ocr_document.close()
 
 # Create Excel Report
 
