@@ -1,13 +1,26 @@
-"""Sort scanned Maryland court mail into per-document-type folders.
+"""PROOF OF CONCEPT: courtmail.py with built-in OCR.
 
-Each page of every PDF in the input folder is classified by keyword, matched
-to one of the firm's file numbers via xaa.csv, saved as its own PDF, and
-recorded in a colour-coded Excel report.
+Identical to courtmail.py except that pages with no usable text layer are
+OCR'd in-process with Tesseract, in parallel across CPU cores, instead of
+being pre-OCR'd in Adobe. Raw scanner output can be dropped straight into
+the input folder.
+
+Writes to its own output folder ("Output OCR Test") so a concept run can
+never disturb the production Output tree. courtmail.py is untouched.
 """
 
 import csv
+import os
 import re
+import shutil
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+
+import pymupdf  # renders pages to images for OCR
+import pytesseract
+from PIL import Image
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill
 from pypdf import PdfReader, PdfWriter
@@ -15,7 +28,58 @@ from pypdf import PdfReader, PdfWriter
 # Folder Settings
 
 INPUT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Input")
-OUTPUT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Output")
+
+# Deliberately NOT the production Output folder
+OUTPUT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Output OCR Test")
+
+
+# OCR Settings
+
+# 300 DPI is the lowest that reliably keeps the DC-BNV-* form codes in the
+# page footer legible. They are small print, and they are the primary
+# classification signal, so this is not worth lowering for speed.
+OCR_DPI = 300
+
+# Leave one core for the rest of the machine
+OCR_WORKERS = max(1, (os.cpu_count() or 2) - 1)
+
+# A page whose existing text layer is at least this many characters is
+# treated as already OCR'd and is not sent through Tesseract. Real pages
+# in these batches carry 900-2,000 characters; anything under this is a
+# blank or an image-only scan.
+MIN_TEXT_CHARS = 100
+
+# Tesseract is a native binary and cannot be pip-installed. Checked in
+# PATH first, then the usual Windows install locations. The LOCALAPPDATA
+# one is where the installer puts it when run without admin rights, which
+# is how it is installed here - so it is listed first.
+# Folder this script (or the built .exe) is sitting in. A PyInstaller
+# --onefile build unpacks itself to a temp folder, so sys.executable is the
+# only thing that still points at where the user actually put the program.
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys.executable).parent
+else:
+    APP_DIR = Path(__file__).parent
+
+# Checked before any installed copy, so a portable "Tesseract-OCR" folder
+# living next to this program is what gets used. That is what lets the whole
+# thing run from the F drive on a machine where Tesseract was never installed.
+BUNDLED_TESSERACT = APP_DIR / "Tesseract-OCR" / "tesseract.exe"
+
+TESSERACT_CANDIDATES = [
+    str(BUNDLED_TESSERACT),
+    str(
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "Tesseract-OCR"
+        / "tesseract.exe"
+    ),
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+]
+
+# --psm 3 = fully automatic page segmentation, which suits these
+# single-column notices with a header block and a footer form code.
+TESSERACT_CONFIG = "--psm 3"
 
 # Case Number -> File Number lookup source
 # Columns used: "case" (court case number) and
@@ -296,6 +360,151 @@ def extract_page_text(page):
         return clean_text(text)
 
     return ""
+
+
+# OCR
+#
+# Tesseract is slow enough (roughly 0.5-2 seconds per page) that it has to
+# run across several cores to beat the Adobe pass it replaces. Rendering is
+# cheap by comparison - about 114 ms per page at 300 DPI - so the whole
+# batch is OCR'd up front, in parallel, and the results are handed to the
+# existing page loop as plain text. Nothing downstream knows or cares that
+# the text came from Tesseract instead of a PDF text layer.
+
+# Each worker process opens the PDF once and keeps it open, rather than
+# reopening it per page or shipping page images back and forth.
+WORKER_DOCUMENT = {}
+
+
+def find_tesseract():
+    """Return the path to tesseract.exe, or None if it is not installed."""
+
+    # Known locations first -- the bundled copy heads that list, so it wins
+    # over whatever version happens to be on the machine's PATH. Two
+    # different Tesseract builds can read the same page differently, and the
+    # keyword tables are calibrated against one of them.
+    for candidate in TESSERACT_CANDIDATES:
+
+        if Path(candidate).exists():
+            return candidate
+
+    return shutil.which("tesseract")
+
+
+def worker_init(pdf_path, tesseract_path):
+    """Open the PDF once per worker process and point at Tesseract."""
+
+    WORKER_DOCUMENT["document"] = pymupdf.open(pdf_path)
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+
+
+def ocr_one_page(page_number):
+    """OCR a single page in a worker. Returns (page_number, text)."""
+
+    document = WORKER_DOCUMENT["document"]
+
+    try:
+
+        pixmap = document[page_number].get_pixmap(dpi=OCR_DPI)
+
+        image = Image.frombytes(
+            "RGB",
+            (pixmap.width, pixmap.height),
+            pixmap.samples
+        )
+
+        text = pytesseract.image_to_string(
+            image,
+            config=TESSERACT_CONFIG
+        )
+
+    # A worker crash would abandon the whole batch, so a page that will
+    # not OCR comes back empty and lands in Review like any unreadable one.
+    except Exception as error:  # pylint: disable=broad-exception-caught
+
+        print(f"  OCR failed on page {page_number + 1}: {error}")
+
+        return page_number, ""
+
+    return page_number, clean_text(text)
+
+
+def pages_needing_ocr(pdf_path):
+    """Return the page numbers that have no usable text layer already."""
+
+    needed = []
+
+    with pymupdf.open(pdf_path) as document:
+
+        for page_number in range(document.page_count):
+
+            text = str(document[page_number].get_text("text")).strip()
+
+            if len(text) < MIN_TEXT_CHARS:
+                needed.append(page_number)
+
+    return needed
+
+
+def ocr_pdf(pdf_path, tesseract_path):
+    """OCR every image-only page of a PDF. Returns {page_number: text}.
+
+    Pages that already carry a text layer are left out of the result, so
+    the caller falls back to reading them normally.
+    """
+
+    needed = pages_needing_ocr(pdf_path)
+
+    if not needed:
+
+        print("Every page already has a text layer - skipping OCR.")
+
+        return {}
+
+    print(
+        f"OCR: {len(needed)} page(s) need it, "
+        f"using {OCR_WORKERS} worker(s) at {OCR_DPI} DPI."
+    )
+
+    started = time.perf_counter()
+    page_texts = {}
+
+    with ProcessPoolExecutor(
+        max_workers=OCR_WORKERS,
+        initializer=worker_init,
+        initargs=(str(pdf_path), tesseract_path)
+    ) as pool:
+
+        for done, (page_number, text) in enumerate(
+            pool.map(ocr_one_page, needed),
+            start=1
+        ):
+
+            page_texts[page_number] = text
+
+            # Overwrite one line rather than scrolling thousands
+            if done % 10 == 0 or done == len(needed):
+
+                elapsed = time.perf_counter() - started
+                rate = done / elapsed if elapsed else 0
+
+                print(
+                    f"  OCR {done}/{len(needed)} pages "
+                    f"({rate:.1f} pages/sec)",
+                    end="\r",
+                    flush=True
+                )
+
+    elapsed = time.perf_counter() - started
+
+    print()
+    print(
+        f"OCR finished in {elapsed / 60:.1f} minutes "
+        f"({len(needed) / elapsed:.1f} pages/sec)."
+    )
+    print()
+
+    return page_texts
 
 
 # Page Classification
@@ -918,9 +1127,17 @@ def process_pdf(
     report_data,
     exact_matches,
     variant_matches,
-    seen_documents
+    seen_documents,
+    page_texts=None
 ):
-    """Classify, save and report every page of one input PDF."""
+    """Classify, save and report every page of one input PDF.
+
+    page_texts maps a 0-based page number to text already obtained by OCR.
+    Pages absent from it are read from the PDF's own text layer, exactly as
+    courtmail.py does.
+    """
+
+    page_texts = page_texts or {}
 
     print()
     print("=" * 60)
@@ -944,7 +1161,11 @@ def process_pdf(
             f"{page_number}/{total_pages}"
         )
 
-        text = extract_page_text(page)
+        # OCR result when we have one, otherwise the PDF's own text layer
+        if page_number - 1 in page_texts:
+            text = page_texts[page_number - 1]
+        else:
+            text = extract_page_text(page)
 
         status = "Sorted"
         destination = "Sorted"
@@ -1394,9 +1615,29 @@ def main():
     """Sort every PDF in the input folder and write the Excel report."""
 
     print()
-    print("Court Mail Sorter")
+    print("Court Mail Sorter - OCR PROOF OF CONCEPT")
     print("=" * 60)
+    print(f"Output goes to: {OUTPUT_FOLDER}")
+    print("The production Output folder is not touched.")
     print()
+
+    tesseract_path = find_tesseract()
+
+    if not tesseract_path:
+
+        print("Tesseract is not installed on this machine.")
+        print()
+        print("The pytesseract package alone is not enough - it is only a")
+        print("wrapper around the tesseract.exe program, which has to be")
+        print("installed separately. Get the Windows build from:")
+        print("  https://github.com/UB-Mannheim/tesseract/wiki")
+        print()
+        print("Install it, then run this again. Nothing has been changed.")
+
+        return
+
+    print(f"Using Tesseract: {tesseract_path}")
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
 
     create_folders()
 
@@ -1453,13 +1694,20 @@ def main():
 
         try:
 
+            print()
+            print("=" * 60)
+            print(f"OCR pass: {pdf_path.name}")
+
+            page_texts = ocr_pdf(pdf_path, tesseract_path)
+
             process_pdf(
                 pdf_path,
                 document_counts,
                 report_data,
                 exact_matches,
                 variant_matches,
-                seen_documents
+                seen_documents,
+                page_texts
             )
 
         # One bad PDF must not abandon the rest of the batch, and the
@@ -1500,6 +1748,29 @@ def main():
     )
 
     print("-" * 60)
+
+    # OCR Quality Check
+    #
+    # The number that decides whether Tesseract is good enough. The Adobe
+    # workflow leaves about 1.2% of pages unclassified (44 of 3,618 on the
+    # 9-9-26 batch). If this figure is close to that, the keyword tables
+    # survived the change of OCR engine. If it is much higher, Tesseract is
+    # garbling text in ways the tables do not account for yet.
+
+    review_count = document_counts.get("Review", 0)
+
+    if total_documents:
+
+        print("OCR Quality:")
+
+        print(
+            f"  Unclassified (Review): {review_count} of "
+            f"{total_documents} pages "
+            f"({review_count / total_documents * 100:.1f}%)"
+        )
+
+        print("  Adobe workflow baseline: about 1.2%")
+        print("-" * 60)
 
     # File Number Summary
 
@@ -1568,6 +1839,12 @@ if __name__ == "__main__":
     # the full traceback on a crash and always wait for Enter, so neither
     # an error nor the early "no PDF files" return can make the console
     # vanish before it has been read.
+    # Required before ProcessPoolExecutor if this is ever frozen into an
+    # .exe, and harmless when running as a plain script.
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+
     try:
 
         main()
