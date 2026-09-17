@@ -4,15 +4,13 @@ Identical to courtmail.py except that pages with no usable text layer are
 OCR'd in-process by calling AWS Textract, in parallel across a thread pool,
 instead of being pre-OCR'd in Adobe. Raw scanner output can be dropped
 straight into the input folder.
-
-Writes to its own output folder ("Output OCR Test") so a concept run can
-never disturb the production Output tree. courtmail.py is untouched.
 """
 
 import csv
 import getpass
 import io
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -29,8 +27,7 @@ from pypdf import PdfReader, PdfWriter
 
 INPUT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Input")
 
-# Deliberately NOT the production Output folder
-OUTPUT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Output OCR Test")
+OUTPUT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Output")
 
 
 # OCR Settings (AWS Textract)
@@ -55,6 +52,57 @@ TEXTRACT_REGION = "us-east-1"
 # batches carry 900-2,000 characters; anything under this is a blank or an
 # image-only scan.
 MIN_TEXT_CHARS = 100
+
+
+# Hard ceiling on estimated Textract spend for one run of this program, so
+# an oversized or accidental drop into the input folder cannot run up an
+# unbounded bill. Pages beyond the cap are treated like any other unreadable
+# page - they land in Review instead of being sent to Textract.
+SPEND_LIMIT_USD = 30.00
+
+# DetectDocumentText list price as of this writing - the top (cheapest
+# committed) tier, so this is a conservative (i.e. slightly high) estimate.
+# Check https://aws.amazon.com/textract/pricing/ if this hasn't been
+# reviewed in a while; pricing can change and varies by region.
+TEXTRACT_PRICE_PER_PAGE_USD = 0.0015
+
+
+class SpendGuard:
+    """Tracks estimated Textract spend across a whole run and cuts it off
+    at SPEND_LIMIT_USD.
+
+    Shared by every OCR worker thread across every PDF in the batch, so the
+    cap applies to the run as a whole, not per file. This is a client-side
+    estimate against a fixed price constant, not a real AWS-enforced
+    billing limit - it stops this program from sending more pages, nothing
+    else.
+    """
+
+    def __init__(self, limit_usd, price_per_page_usd):
+        self.limit_usd = limit_usd
+        self.price_per_page_usd = price_per_page_usd
+        self.pages_sent = 0
+        self.pages_skipped = 0
+        self._lock = threading.Lock()
+
+    def try_charge(self):
+        """Reserve the cost of one page. Returns False past the cap."""
+
+        with self._lock:
+
+            spent = self.pages_sent * self.price_per_page_usd
+
+            if spent + self.price_per_page_usd > self.limit_usd:
+
+                self.pages_skipped += 1
+                return False
+
+            self.pages_sent += 1
+            return True
+
+    @property
+    def spent_usd(self):
+        return self.pages_sent * self.price_per_page_usd
 
 
 # AWS Credentials
@@ -397,8 +445,17 @@ def render_page_image(document, page_number):
     return buffer.getvalue()
 
 
-def textract_page(client, page_number, image_bytes):
+def textract_page(client, page_number, image_bytes, spend_guard):
     """Run Textract on one page image. Returns (page_number, text)."""
+
+    if not spend_guard.try_charge():
+
+        print(
+            f"  Skipping page {page_number + 1}: this run has reached "
+            f"its ${spend_guard.limit_usd:.2f} Textract spend limit."
+        )
+
+        return page_number, ""
 
     try:
 
@@ -443,12 +500,14 @@ def pages_needing_ocr(pdf_path):
     return needed
 
 
-def ocr_pdf(pdf_path, client):
+def ocr_pdf(pdf_path, client, spend_guard):
     """OCR every image-only page of a PDF with Textract. Returns
     {page_number: text}.
 
     Pages that already carry a text layer are left out of the result, so
-    the caller falls back to reading them normally.
+    the caller falls back to reading them normally. spend_guard is shared
+    across every PDF in the batch, so the run-wide spend cap applies here
+    too, not just within one file.
     """
 
     needed = pages_needing_ocr(pdf_path)
@@ -478,7 +537,9 @@ def ocr_pdf(pdf_path, client):
     with ThreadPoolExecutor(max_workers=TEXTRACT_WORKERS) as pool:
 
         futures = [
-            pool.submit(textract_page, client, page_number, image_bytes)
+            pool.submit(
+                textract_page, client, page_number, image_bytes, spend_guard
+            )
             for page_number, image_bytes in images.items()
         ]
 
@@ -1623,7 +1684,6 @@ def main():
     print("Court Mail Sorter - OCR (AWS Textract)")
     print("=" * 60)
     print(f"Output goes to: {OUTPUT_FOLDER}")
-    print("The production Output folder is not touched.")
     print()
 
     textract_client = get_textract_client()
@@ -1634,7 +1694,13 @@ def main():
         "error, the Access Key / Secret Key entered were wrong - just "
         "run the program again to re-enter them.)"
     )
+    print(
+        f"Textract spend cap for this run: ${SPEND_LIMIT_USD:.2f} "
+        f"(est. {int(SPEND_LIMIT_USD / TEXTRACT_PRICE_PER_PAGE_USD):,} pages)"
+    )
     print()
+
+    spend_guard = SpendGuard(SPEND_LIMIT_USD, TEXTRACT_PRICE_PER_PAGE_USD)
 
     create_folders()
 
@@ -1695,7 +1761,7 @@ def main():
             print("=" * 60)
             print(f"OCR pass: {pdf_path.name}")
 
-            page_texts = ocr_pdf(pdf_path, textract_client)
+            page_texts = ocr_pdf(pdf_path, textract_client, spend_guard)
 
             process_pdf(
                 pdf_path,
@@ -1768,6 +1834,24 @@ def main():
 
         print("  Adobe workflow baseline: about 1.2%")
         print("-" * 60)
+
+    # Textract Spend Summary
+
+    print("Textract Spend (estimate):")
+
+    print(
+        f"  Pages sent: {spend_guard.pages_sent:,} "
+        f"(~${spend_guard.spent_usd:.2f} of ${SPEND_LIMIT_USD:.2f} cap)"
+    )
+
+    if spend_guard.pages_skipped:
+
+        print(
+            f"  Pages skipped - spend limit reached: "
+            f"{spend_guard.pages_skipped:,} (sent to Review)"
+        )
+
+    print("-" * 60)
 
     # File Number Summary
 

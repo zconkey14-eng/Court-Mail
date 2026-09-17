@@ -72,7 +72,7 @@ No install, no Python, nothing to set up beyond the AWS keys above. Just:
 3. If asked, enter the AWS Access Key ID and Secret Access Key.
 4. It reads PDFs from `F:\Legal\MD\Court Mail\Input`, OCRs any pages that
    need it via Textract, sorts them, and writes results to
-   `F:\Legal\MD\Court Mail\Output OCR Test` plus an Excel report.
+   `F:\Legal\MD\Court Mail\Output` plus an Excel report.
 5. Press Enter when it says "Press Enter to close" to close the window.
 
 ## Cost and rate limits
@@ -85,6 +85,17 @@ AWS's default per-account request-rate quota for Textract, not the number
 of cores on the machine. If large batches are hitting throttling errors,
 request a Service Quota increase for Textract in the AWS account rather
 than just raising this number.
+
+**Spend cap:** `SPEND_LIMIT_USD` at the top of `courtmail_ocr.py` (default
+`$30.00` per run) stops the program from sending any more pages to Textract
+once estimated spend would cross it - the rest of that run's pages are
+treated like any other unreadable page and land in Review instead. This is
+a client-side estimate against the `TEXTRACT_PRICE_PER_PAGE_USD` constant
+next to it, **not** a real AWS-enforced billing limit - it only stops this
+program, and the estimate drifts if AWS pricing changes. For a true
+account-wide hard limit, pair this with an AWS Budget alert (or a budget
+action) on the account itself. The end-of-run summary in the console shows
+how many pages were actually sent and the estimated cost.
 
 ## Troubleshooting
 
