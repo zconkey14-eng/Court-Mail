@@ -8,6 +8,11 @@ You do the build **once**, on any one Windows computer at work that has
 Python. The output is a folder you copy to the shared drive; everyone else
 just runs the `.exe` inside it.
 
+**What lives where:** this repo holds the source script and the build
+tooling only (`courtmail_ocr.py`, `build.bat`, `requirements.txt`). The
+built `.exe` and the portable `Tesseract-OCR` folder are build *output* -
+they belong on the shared drive (Step 3), never committed here.
+
 ## Why this is needed
 
 - `pytesseract` (already in the script) is only a wrapper - it calls a real
@@ -64,6 +69,13 @@ right beside it in a folder named exactly `Tesseract-OCR`.
 
 3. That's it - the `Tesseract-OCR` folder now travels with the program.
    You (or IT) never have to install Tesseract on any other computer again.
+
+**Do not commit this `Tesseract-OCR` folder to this repo.** It's a couple
+hundred MB of binaries once `tesseract.exe` and `tessdata` are in it, GitHub's
+web uploader chokes on that many large files (this is why an earlier partial
+upload of it exists in this repo's history), and it doesn't belong in source
+control anyway - it's a build output, not code. It only ever needs to live in
+one place: next to the exe on the shared drive (Step 3).
 
 ## Step 3 - Deploy to the shared drive
 
