@@ -1,8 +1,12 @@
 # Court Mail Sorter OCR - Packaging Guide
 
 This turns `courtmail_ocr.py` into a standalone program that anyone on the
-shared drive can run by double-clicking - no Python, no pip installs, no
-Tesseract installer, nothing to set up on their own computer.
+shared drive can run by double-clicking - no Python and no pip installs on
+their own computer.
+
+OCR is done by calling AWS Textract, so there's no local OCR engine to
+install or bundle at all - every machine just needs the exe and network
+access to AWS.
 
 You do the build **once**, on any one Windows computer at work that has
 Python. The output is a folder you copy to the shared drive; everyone else
@@ -10,21 +14,8 @@ just runs the `.exe` inside it.
 
 **What lives where:** this repo holds the source script and the build
 tooling only (`courtmail_ocr.py`, `build.bat`, `requirements.txt`). The
-built `.exe` and the portable `Tesseract-OCR` folder are build *output* -
-they belong on the shared drive (Step 3), never committed here.
-
-## Why this is needed
-
-- `pytesseract` (already in the script) is only a wrapper - it calls a real
-  `tesseract.exe` program, which is a separate native install, not something
-  pip can install.
-- The script already knows how to find a **portable** copy of Tesseract: it
-  looks for a `Tesseract-OCR` folder sitting right next to itself before
-  checking anywhere else on the machine (see `BUNDLED_TESSERACT` in
-  `courtmail_ocr.py`). So dropping a Tesseract-OCR folder next to the built
-  exe is all that's needed - nobody has to install Tesseract themselves.
-- Turning the script into a `.exe` (via PyInstaller) means coworkers don't
-  need Python installed either.
+built `.exe` is build *output* - it belongs on the shared drive (Step 2),
+never committed here.
 
 ## Step 1 - One-time build (do this on one Windows computer)
 
@@ -37,7 +28,8 @@ computer, with internet access to download packages.
 2. Double-click `build.bat`.
    - It creates a private `build_venv` folder so this doesn't touch any
      other Python setup on the computer.
-   - It installs the required packages and runs PyInstaller.
+   - It installs the required packages (including `boto3`, the AWS SDK)
+     and runs PyInstaller.
    - When it finishes, your program is at
      `dist\CourtMailSorterOCR\CourtMailSorterOCR.exe`.
 
@@ -45,65 +37,67 @@ If `build.bat` says Python isn't found, install it from
 [python.org/downloads](https://www.python.org/downloads/) - check
 **"Add python.exe to PATH"** during install - then run `build.bat` again.
 
-## Step 2 - Add a portable Tesseract-OCR folder
+## Step 2 - Deploy to the shared drive
 
-The exe alone isn't enough; it needs Tesseract's own program files sitting
-right beside it in a folder named exactly `Tesseract-OCR`.
+Copy the entire `dist\CourtMailSorterOCR` folder to wherever on the shared
+drive people should run it from. Keep the exe together with the other files
+PyInstaller put next to it in that folder.
 
-1. On the same build computer, install Tesseract normally, one time, from
-   the Windows build here:
-   https://github.com/UB-Mannheim/tesseract/wiki
-   (Use the default install location, e.g.
-   `C:\Program Files\Tesseract-OCR`.)
-2. Copy that entire installed folder into your build output, so you have:
+## Step 3 - AWS credentials
 
-   ```
-   dist\CourtMailSorterOCR\
-       CourtMailSorterOCR.exe
-       ...(other files PyInstaller put here)...
-       Tesseract-OCR\
-           tesseract.exe
-           tessdata\
-           ...
-   ```
+Every machine needs to reach AWS Textract with a valid Access Key ID /
+Secret Access Key that has `textract:DetectDocumentText` permission, and
+needs the region set in `TEXTRACT_REGION` at the top of `courtmail_ocr.py`
+to be one where Textract is available.
 
-3. That's it - the `Tesseract-OCR` folder now travels with the program.
-   You (or IT) never have to install Tesseract on any other computer again.
+There are two ways to supply the keys - the script tries them in this
+order:
 
-**Do not commit this `Tesseract-OCR` folder to this repo.** It's a couple
-hundred MB of binaries once `tesseract.exe` and `tessdata` are in it, GitHub's
-web uploader chokes on that many large files (this is why an earlier partial
-upload of it exists in this repo's history), and it doesn't belong in source
-control anyway - it's a build output, not code. It only ever needs to live in
-one place: next to the exe on the shared drive (Step 3).
-
-## Step 3 - Deploy to the shared drive
-
-Copy the entire `dist\CourtMailSorterOCR` folder (exe + support files +
-`Tesseract-OCR` folder, all together) to wherever on the shared drive people
-should run it from. Keep everything in that one folder together - don't
-separate the exe from `Tesseract-OCR` or the other files next to it.
+1. **Already set on the machine** - if `AWS_ACCESS_KEY_ID` and
+   `AWS_SECRET_ACCESS_KEY` are set as environment variables (or an AWS CLI
+   profile is configured), the program uses them automatically and asks for
+   nothing.
+2. **Typed in at runtime** - if neither is found, the program prompts for
+   the Access Key ID and Secret Access Key when it starts. They are held in
+   memory for that run only and are never written to disk, so this is safe
+   to do on a shared machine, but it does mean typing them in every time the
+   program is run unless step 1 is set up instead.
 
 ## Step 4 - Using it (everyone else)
 
-No install, no Python, nothing to set up. Just:
+No install, no Python, nothing to set up beyond the AWS keys above. Just:
 
 1. Open the shared folder.
 2. Double-click `CourtMailSorterOCR.exe`.
-3. It reads PDFs from `F:\Legal\MD\Court Mail\Input`, OCRs any pages that
-   need it, sorts them, and writes results to
+3. If asked, enter the AWS Access Key ID and Secret Access Key.
+4. It reads PDFs from `F:\Legal\MD\Court Mail\Input`, OCRs any pages that
+   need it via Textract, sorts them, and writes results to
    `F:\Legal\MD\Court Mail\Output OCR Test` plus an Excel report.
-4. Press Enter when it says "Press Enter to close" to close the window.
+5. Press Enter when it says "Press Enter to close" to close the window.
+
+## Cost and rate limits
+
+Textract's `DetectDocumentText` call is billed per page - check current
+pricing at https://aws.amazon.com/textract/pricing/ before running large
+batches. Pages are sent `TEXTRACT_WORKERS` at a time (8 by default, set at
+the top of `courtmail_ocr.py`); this is deliberately conservative against
+AWS's default per-account request-rate quota for Textract, not the number
+of cores on the machine. If large batches are hitting throttling errors,
+request a Service Quota increase for Textract in the AWS account rather
+than just raising this number.
 
 ## Troubleshooting
 
-- **"Tesseract is not installed on this machine"** - the `Tesseract-OCR`
-  folder isn't sitting next to `CourtMailSorterOCR.exe`, or got renamed.
-  Confirm the folder name is exactly `Tesseract-OCR` and it's a sibling of
-  the exe, not nested inside another folder.
+- **Every page fails with a credentials/signature error** - the Access Key
+  ID or Secret Access Key entered was wrong, or the IAM user behind them
+  doesn't have Textract permission. Run the program again to re-enter the
+  keys, or fix the IAM permissions.
 - **Antivirus flags or deletes the exe** - PyInstaller executables sometimes
   trigger false positives on locked-down work computers. If IT's antivirus
   quarantines it, you may need it whitelisted by path.
+- **No internet / AWS unreachable** - Textract calls need outbound HTTPS
+  access to AWS from the machine; a locked-down corporate firewall may need
+  an allowance for the Textract endpoint in the configured region.
 - **Different drive letters** - the script expects the shared drive mapped
   as `F:`. If any computer maps the same network share to a different
   letter, the Input/Output/xaa.csv paths at the top of `courtmail_ocr.py`
@@ -111,4 +105,4 @@ No install, no Python, nothing to set up. Just:
   mapping to `F:` on every machine.
 - **Rebuilding after a script change** - re-run `build.bat` (delete the old
   `build_venv`, `build`, and `dist` folders first if you want a totally
-  clean build), then redo Step 2 and Step 3.
+  clean build), then redo Step 2.

@@ -47,7 +47,8 @@ echo (This can take a few minutes the first time.)
 pyinstaller --noconfirm --onedir --console ^
     --name CourtMailSorterOCR ^
     --collect-all pymupdf ^
-    --collect-all pytesseract ^
+    --collect-all boto3 ^
+    --collect-all botocore ^
     courtmail_ocr.py
 if errorlevel 1 goto :error
 
@@ -58,14 +59,11 @@ echo.
 echo  Your program is here:
 echo    dist\CourtMailSorterOCR\CourtMailSorterOCR.exe
 echo.
-echo  NEXT STEP - before anyone can run it, you must add a
-echo  portable copy of Tesseract-OCR next to the exe. See
-echo  README.md, section "Adding Tesseract-OCR", for how.
-echo.
-echo  Once that folder is added, copy the ENTIRE
-echo  dist\CourtMailSorterOCR folder to the shared drive.
-echo  Everyone runs CourtMailSorterOCR.exe from there directly -
-echo  no install needed on their machines.
+echo  Copy the ENTIRE dist\CourtMailSorterOCR folder to the shared
+echo  drive. Everyone runs CourtMailSorterOCR.exe from there
+echo  directly - no install needed on their machines. The first
+echo  time it runs without AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+echo  already set on that machine, it will ask for them.
 echo ============================================================
 echo.
 pause

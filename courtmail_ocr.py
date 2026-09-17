@@ -1,25 +1,25 @@
-"""PROOF OF CONCEPT: courtmail.py with built-in OCR.
+"""courtmail.py with built-in OCR via AWS Textract.
 
 Identical to courtmail.py except that pages with no usable text layer are
-OCR'd in-process with Tesseract, in parallel across CPU cores, instead of
-being pre-OCR'd in Adobe. Raw scanner output can be dropped straight into
-the input folder.
+OCR'd in-process by calling AWS Textract, in parallel across a thread pool,
+instead of being pre-OCR'd in Adobe. Raw scanner output can be dropped
+straight into the input folder.
 
 Writes to its own output folder ("Output OCR Test") so a concept run can
 never disturb the production Output tree. courtmail.py is untouched.
 """
 
 import csv
-import os
+import getpass
+import io
 import re
-import shutil
-import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import boto3
 import pymupdf  # renders pages to images for OCR
-import pytesseract
+from botocore.exceptions import BotoCoreError, ClientError
 from PIL import Image
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill
@@ -33,53 +33,60 @@ INPUT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Input")
 OUTPUT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Output OCR Test")
 
 
-# OCR Settings
+# OCR Settings (AWS Textract)
 
 # 300 DPI is the lowest that reliably keeps the DC-BNV-* form codes in the
 # page footer legible. They are small print, and they are the primary
 # classification signal, so this is not worth lowering for speed.
 OCR_DPI = 300
 
-# Leave one core for the rest of the machine
-OCR_WORKERS = max(1, (os.cpu_count() or 2) - 1)
+# Textract's DetectDocumentText call is a network round-trip per page, not
+# CPU work, so this is sized against AWS's default per-account TPS quota
+# for the API rather than the number of cores on the machine. Raise it only
+# after requesting a Service Quota increase for Textract in this account.
+TEXTRACT_WORKERS = 8
+
+# Must be a region where Textract is available:
+# https://docs.aws.amazon.com/general/latest/gr/textract.html
+TEXTRACT_REGION = "us-east-1"
 
 # A page whose existing text layer is at least this many characters is
-# treated as already OCR'd and is not sent through Tesseract. Real pages
-# in these batches carry 900-2,000 characters; anything under this is a
-# blank or an image-only scan.
+# treated as already OCR'd and is not sent to Textract. Real pages in these
+# batches carry 900-2,000 characters; anything under this is a blank or an
+# image-only scan.
 MIN_TEXT_CHARS = 100
 
-# Tesseract is a native binary and cannot be pip-installed. Checked in
-# PATH first, then the usual Windows install locations. The LOCALAPPDATA
-# one is where the installer puts it when run without admin rights, which
-# is how it is installed here - so it is listed first.
-# Folder this script (or the built .exe) is sitting in. A PyInstaller
-# --onefile build unpacks itself to a temp folder, so sys.executable is the
-# only thing that still points at where the user actually put the program.
-if getattr(sys, "frozen", False):
-    APP_DIR = Path(sys.executable).parent
-else:
-    APP_DIR = Path(__file__).parent
 
-# Checked before any installed copy, so a portable "Tesseract-OCR" folder
-# living next to this program is what gets used. That is what lets the whole
-# thing run from the F drive on a machine where Tesseract was never installed.
-BUNDLED_TESSERACT = APP_DIR / "Tesseract-OCR" / "tesseract.exe"
+# AWS Credentials
+#
+# Checked the same way boto3 normally checks - environment variables first
+# - so a machine that already has AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+# set, or a configured AWS CLI profile, needs nothing further. Anywhere
+# else, the keys are asked for once per run and held only in memory - this
+# script never writes them to disk.
 
-TESSERACT_CANDIDATES = [
-    str(BUNDLED_TESSERACT),
-    str(
-        Path(os.environ.get("LOCALAPPDATA", ""))
-        / "Tesseract-OCR"
-        / "tesseract.exe"
-    ),
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-]
+def get_textract_client():
+    """Return a boto3 Textract client, prompting for keys if needed."""
 
-# --psm 3 = fully automatic page segmentation, which suits these
-# single-column notices with a header block and a footer form code.
-TESSERACT_CONFIG = "--psm 3"
+    if boto3.Session().get_credentials() is not None:
+        return boto3.client("textract", region_name=TEXTRACT_REGION)
+
+    print("AWS credentials were not found in the environment.")
+    print(
+        "Enter them now - they are used for this run only and are "
+        "never saved to disk."
+    )
+    print()
+
+    access_key = input("AWS Access Key ID: ").strip()
+    secret_key = getpass.getpass("AWS Secret Access Key: ").strip()
+
+    return boto3.client(
+        "textract",
+        region_name=TEXTRACT_REGION,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key
+    )
 
 # Case Number -> File Number lookup source
 # Columns used: "case" (court case number) and
@@ -364,65 +371,55 @@ def extract_page_text(page):
 
 # OCR
 #
-# Tesseract is slow enough (roughly 0.5-2 seconds per page) that it has to
-# run across several cores to beat the Adobe pass it replaces. Rendering is
-# cheap by comparison - about 114 ms per page at 300 DPI - so the whole
-# batch is OCR'd up front, in parallel, and the results are handed to the
-# existing page loop as plain text. Nothing downstream knows or cares that
-# the text came from Tesseract instead of a PDF text layer.
+# A Textract call is a network round-trip (typically a few hundred ms), so
+# unlike a local Tesseract process the work here is I/O bound, not CPU
+# bound. Pages are rendered to images up front on the main thread -
+# rendering is cheap, about 114 ms per page at 300 DPI, and a pymupdf
+# document is not safe to read from multiple threads at once - then every
+# rendered image is handed to a thread pool that does nothing but wait on
+# the network. Nothing downstream knows or cares that the text came from
+# Textract instead of a PDF text layer.
 
-# Each worker process opens the PDF once and keeps it open, rather than
-# reopening it per page or shipping page images back and forth.
-WORKER_DOCUMENT = {}
+def render_page_image(document, page_number):
+    """Render one PDF page to PNG bytes at OCR_DPI."""
 
+    pixmap = document[page_number].get_pixmap(dpi=OCR_DPI)
 
-def find_tesseract():
-    """Return the path to tesseract.exe, or None if it is not installed."""
+    image = Image.frombytes(
+        "RGB",
+        (pixmap.width, pixmap.height),
+        pixmap.samples
+    )
 
-    # Known locations first -- the bundled copy heads that list, so it wins
-    # over whatever version happens to be on the machine's PATH. Two
-    # different Tesseract builds can read the same page differently, and the
-    # keyword tables are calibrated against one of them.
-    for candidate in TESSERACT_CANDIDATES:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
 
-        if Path(candidate).exists():
-            return candidate
-
-    return shutil.which("tesseract")
-
-
-def worker_init(pdf_path, tesseract_path):
-    """Open the PDF once per worker process and point at Tesseract."""
-
-    WORKER_DOCUMENT["document"] = pymupdf.open(pdf_path)
-    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+    return buffer.getvalue()
 
 
-def ocr_one_page(page_number):
-    """OCR a single page in a worker. Returns (page_number, text)."""
-
-    document = WORKER_DOCUMENT["document"]
+def textract_page(client, page_number, image_bytes):
+    """Run Textract on one page image. Returns (page_number, text)."""
 
     try:
 
-        pixmap = document[page_number].get_pixmap(dpi=OCR_DPI)
-
-        image = Image.frombytes(
-            "RGB",
-            (pixmap.width, pixmap.height),
-            pixmap.samples
+        response = client.detect_document_text(
+            Document={"Bytes": image_bytes}
         )
 
-        text = pytesseract.image_to_string(
-            image,
-            config=TESSERACT_CONFIG
-        )
+        lines = [
+            block["Text"]
+            for block in response.get("Blocks", [])
+            if block["BlockType"] == "LINE"
+        ]
 
-    # A worker crash would abandon the whole batch, so a page that will
-    # not OCR comes back empty and lands in Review like any unreadable one.
-    except Exception as error:  # pylint: disable=broad-exception-caught
+        text = "\n".join(lines)
 
-        print(f"  OCR failed on page {page_number + 1}: {error}")
+    # A page Textract rejects, or a dropped connection, must not stop the
+    # batch - it comes back empty and lands in Review like any other
+    # unreadable page.
+    except (ClientError, BotoCoreError) as error:
+
+        print(f"  Textract failed on page {page_number + 1}: {error}")
 
         return page_number, ""
 
@@ -446,8 +443,9 @@ def pages_needing_ocr(pdf_path):
     return needed
 
 
-def ocr_pdf(pdf_path, tesseract_path):
-    """OCR every image-only page of a PDF. Returns {page_number: text}.
+def ocr_pdf(pdf_path, client):
+    """OCR every image-only page of a PDF with Textract. Returns
+    {page_number: text}.
 
     Pages that already carry a text layer are left out of the result, so
     the caller falls back to reading them normally.
@@ -462,24 +460,31 @@ def ocr_pdf(pdf_path, tesseract_path):
         return {}
 
     print(
-        f"OCR: {len(needed)} page(s) need it, "
-        f"using {OCR_WORKERS} worker(s) at {OCR_DPI} DPI."
+        f"OCR: {len(needed)} page(s) need it, sending to Textract with "
+        f"{TEXTRACT_WORKERS} worker(s) at {OCR_DPI} DPI."
     )
 
     started = time.perf_counter()
+
+    with pymupdf.open(pdf_path) as document:
+
+        images = {
+            page_number: render_page_image(document, page_number)
+            for page_number in needed
+        }
+
     page_texts = {}
 
-    with ProcessPoolExecutor(
-        max_workers=OCR_WORKERS,
-        initializer=worker_init,
-        initargs=(str(pdf_path), tesseract_path)
-    ) as pool:
+    with ThreadPoolExecutor(max_workers=TEXTRACT_WORKERS) as pool:
 
-        for done, (page_number, text) in enumerate(
-            pool.map(ocr_one_page, needed),
-            start=1
-        ):
+        futures = [
+            pool.submit(textract_page, client, page_number, image_bytes)
+            for page_number, image_bytes in images.items()
+        ]
 
+        for done, future in enumerate(as_completed(futures), start=1):
+
+            page_number, text = future.result()
             page_texts[page_number] = text
 
             # Overwrite one line rather than scrolling thousands
@@ -1615,29 +1620,21 @@ def main():
     """Sort every PDF in the input folder and write the Excel report."""
 
     print()
-    print("Court Mail Sorter - OCR PROOF OF CONCEPT")
+    print("Court Mail Sorter - OCR (AWS Textract)")
     print("=" * 60)
     print(f"Output goes to: {OUTPUT_FOLDER}")
     print("The production Output folder is not touched.")
     print()
 
-    tesseract_path = find_tesseract()
+    textract_client = get_textract_client()
 
-    if not tesseract_path:
-
-        print("Tesseract is not installed on this machine.")
-        print()
-        print("The pytesseract package alone is not enough - it is only a")
-        print("wrapper around the tesseract.exe program, which has to be")
-        print("installed separately. Get the Windows build from:")
-        print("  https://github.com/UB-Mannheim/tesseract/wiki")
-        print()
-        print("Install it, then run this again. Nothing has been changed.")
-
-        return
-
-    print(f"Using Tesseract: {tesseract_path}")
-    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+    print(f"Using AWS Textract in region: {TEXTRACT_REGION}")
+    print(
+        "(If every page below fails with a credentials or signature "
+        "error, the Access Key / Secret Key entered were wrong - just "
+        "run the program again to re-enter them.)"
+    )
+    print()
 
     create_folders()
 
@@ -1698,7 +1695,7 @@ def main():
             print("=" * 60)
             print(f"OCR pass: {pdf_path.name}")
 
-            page_texts = ocr_pdf(pdf_path, tesseract_path)
+            page_texts = ocr_pdf(pdf_path, textract_client)
 
             process_pdf(
                 pdf_path,
@@ -1751,10 +1748,10 @@ def main():
 
     # OCR Quality Check
     #
-    # The number that decides whether Tesseract is good enough. The Adobe
+    # The number that decides whether Textract is good enough. The Adobe
     # workflow leaves about 1.2% of pages unclassified (44 of 3,618 on the
     # 9-9-26 batch). If this figure is close to that, the keyword tables
-    # survived the change of OCR engine. If it is much higher, Tesseract is
+    # survived the change of OCR engine. If it is much higher, Textract is
     # garbling text in ways the tables do not account for yet.
 
     review_count = document_counts.get("Review", 0)
@@ -1839,12 +1836,6 @@ if __name__ == "__main__":
     # the full traceback on a crash and always wait for Enter, so neither
     # an error nor the early "no PDF files" return can make the console
     # vanish before it has been read.
-    # Required before ProcessPoolExecutor if this is ever frozen into an
-    # .exe, and harmless when running as a plain script.
-    import multiprocessing
-
-    multiprocessing.freeze_support()
-
     try:
 
         main()
