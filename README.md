@@ -1,6 +1,6 @@
-# Court Mail Sorter OCR - Packaging Guide
+# Court Mail Sorter AWS - Packaging Guide
 
-This turns `courtmail_ocr.py` into a standalone program that anyone on the
+This turns `courtmail_aws.py` into a standalone program that anyone on the
 shared drive can run by double-clicking - no Python and no pip installs on
 their own computer.
 
@@ -13,7 +13,7 @@ Python. The output is a folder you copy to the shared drive; everyone else
 just runs the `.exe` inside it.
 
 **What lives where:** this repo holds the source script and the build
-tooling only (`courtmail_ocr.py`, `build.bat`, `requirements.txt`). The
+tooling only (`courtmail_aws.py`, `build.bat`, `requirements.txt`). The
 built `.exe` is build *output* - it belongs on the shared drive (Step 2),
 never committed here.
 
@@ -22,7 +22,7 @@ never committed here.
 Requirements for this step only: Python 3.9+ installed on the build
 computer, with internet access to download packages.
 
-1. Copy this whole folder (`courtmail_ocr.py`, `requirements.txt`,
+1. Copy this whole folder (`courtmail_aws.py`, `requirements.txt`,
    `build.bat`) somewhere local (not the network drive - building on a
    local disk is much faster).
 2. Double-click `build.bat`.
@@ -31,7 +31,7 @@ computer, with internet access to download packages.
    - It installs the required packages (including `boto3`, the AWS SDK)
      and runs PyInstaller.
    - When it finishes, your program is at
-     `dist\CourtMailSorterOCR\CourtMailSorterOCR.exe`.
+     `dist\CourtMailSorterAWS\CourtMailSorterAWS.exe`.
 
 If `build.bat` says Python isn't found, install it from
 [python.org/downloads](https://www.python.org/downloads/) - check
@@ -39,7 +39,7 @@ If `build.bat` says Python isn't found, install it from
 
 ## Step 2 - Deploy to the shared drive
 
-Copy the entire `dist\CourtMailSorterOCR` folder to wherever on the shared
+Copy the entire `dist\CourtMailSorterAWS` folder to wherever on the shared
 drive people should run it from. Keep the exe together with the other files
 PyInstaller put next to it in that folder.
 
@@ -47,7 +47,7 @@ PyInstaller put next to it in that folder.
 
 Every machine needs to reach AWS Textract with a valid Access Key ID /
 Secret Access Key that has `textract:DetectDocumentText` permission, and
-needs the region set in `TEXTRACT_REGION` at the top of `courtmail_ocr.py`
+needs the region set in `TEXTRACT_REGION` at the top of `courtmail_aws.py`
 to be one where Textract is available.
 
 There are two ways to supply the keys - the script tries them in this
@@ -68,7 +68,7 @@ order:
 No install, no Python, nothing to set up beyond the AWS keys above. Just:
 
 1. Open the shared folder.
-2. Double-click `CourtMailSorterOCR.exe`.
+2. Double-click `CourtMailSorterAWS.exe`.
 3. If asked, enter the AWS Access Key ID and Secret Access Key.
 4. It reads PDFs from `F:\Legal\MD\Court Mail\Input`, OCRs any pages that
    need it via Textract, sorts them, and writes results to
@@ -80,13 +80,13 @@ No install, no Python, nothing to set up beyond the AWS keys above. Just:
 Textract's `DetectDocumentText` call is billed per page - check current
 pricing at https://aws.amazon.com/textract/pricing/ before running large
 batches. Pages are sent `TEXTRACT_WORKERS` at a time (8 by default, set at
-the top of `courtmail_ocr.py`); this is deliberately conservative against
+the top of `courtmail_aws.py`); this is deliberately conservative against
 AWS's default per-account request-rate quota for Textract, not the number
 of cores on the machine. If large batches are hitting throttling errors,
 request a Service Quota increase for Textract in the AWS account rather
 than just raising this number.
 
-**Spend cap:** `SPEND_LIMIT_USD` at the top of `courtmail_ocr.py` (default
+**Spend cap:** `SPEND_LIMIT_USD` at the top of `courtmail_aws.py` (default
 `$30.00` per run) stops the program from sending any more pages to Textract
 once estimated spend would cross it - the rest of that run's pages are
 treated like any other unreadable page and land in Review instead. This is
@@ -111,7 +111,7 @@ how many pages were actually sent and the estimated cost.
   an allowance for the Textract endpoint in the configured region.
 - **Different drive letters** - the script expects the shared drive mapped
   as `F:`. If any computer maps the same network share to a different
-  letter, the Input/Output/xaa.csv paths at the top of `courtmail_ocr.py`
+  letter, the Input/Output/xaa.csv paths at the top of `courtmail_aws.py`
   will need updating (and a rebuild) to match, or IT should standardize the
   mapping to `F:` on every machine.
 - **Rebuilding after a script change** - re-run `build.bat` (delete the old

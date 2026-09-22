@@ -1,10 +1,10 @@
 @echo off
 REM ============================================================
-REM  Court Mail Sorter OCR - one-time build script
+REM  Court Mail Sorter AWS - one-time build script
 REM
 REM  Run this ONCE, on any Windows computer that has Python
 REM  installed. It produces a standalone folder containing
-REM  CourtMailSorterOCR.exe that nobody else needs Python for -
+REM  CourtMailSorterAWS.exe that nobody else needs Python for -
 REM  they just double-click the exe from the shared drive.
 REM
 REM  If this computer does not have Python, install it first
@@ -42,14 +42,14 @@ pip install -r requirements.txt
 if errorlevel 1 goto :error
 
 echo.
-echo Building CourtMailSorterOCR.exe ...
+echo Building CourtMailSorterAWS.exe ...
 echo (This can take a few minutes the first time.)
 pyinstaller --noconfirm --onedir --console ^
-    --name CourtMailSorterOCR ^
+    --name CourtMailSorterAWS ^
     --collect-all pymupdf ^
     --collect-all boto3 ^
     --collect-all botocore ^
-    courtmail_ocr.py
+    courtmail_aws.py
 if errorlevel 1 goto :error
 
 echo.
@@ -57,10 +57,10 @@ echo ============================================================
 echo  Build finished.
 echo.
 echo  Your program is here:
-echo    dist\CourtMailSorterOCR\CourtMailSorterOCR.exe
+echo    dist\CourtMailSorterAWS\CourtMailSorterAWS.exe
 echo.
-echo  Copy the ENTIRE dist\CourtMailSorterOCR folder to the shared
-echo  drive. Everyone runs CourtMailSorterOCR.exe from there
+echo  Copy the ENTIRE dist\CourtMailSorterAWS folder to the shared
+echo  drive. Everyone runs CourtMailSorterAWS.exe from there
 echo  directly - no install needed on their machines. The first
 echo  time it runs without AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
 echo  already set on that machine, it will ask for them.
