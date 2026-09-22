@@ -332,6 +332,69 @@ TRASH_DOCUMENTS = {
 }
 
 
+# Owen Exception
+#
+# Granted Motion is trash (see TRASH_DOCUMENTS above) EXCEPT for a granted
+# motion for a garnishment out of Anne Arundel or Allegany County - those
+# are kept and filed under their own "Owen" folder instead, split into a
+# sub-folder per county. A page must name exactly one of the two counties
+# (a page never names both) AND match something in GARNISHMENT_KEYWORDS to
+# qualify; matching only one of the two is not enough.
+#
+# TODO: keyword lists below are placeholders - fill in the real phrases /
+# form codes that identify a garnishment motion and Anne Arundel / Allegany
+# County.
+
+OWEN_FOLDER = "Owen"
+
+GARNISHMENT_KEYWORDS = [
+]
+
+# County name -> the keywords that identify it. Each becomes its own
+# sub-folder under Owen ("Owen/Anne Arundel", "Owen/Allegany").
+OWEN_COUNTIES = {
+    "Anne Arundel": [
+    ],
+    "Allegany": [
+    ],
+}
+
+
+def matched_owen_county(text_lower, text_glued):
+    """Return the Owen county this page names ("Anne Arundel" / "Allegany"),
+    or None if it names neither."""
+
+    for county, keywords in OWEN_COUNTIES.items():
+
+        for keyword in keywords:
+
+            if keyword_matches(keyword, text_lower, text_glued):
+                return county
+
+    return None
+
+
+def owen_exception_folder(text_lower, text_glued):
+    """Return the Owen sub-folder ("Owen/<county>") for a granted
+    garnishment motion out of a qualifying county, or None otherwise - the
+    one Granted Motion that is kept instead of trashed."""
+
+    county = matched_owen_county(text_lower, text_glued)
+
+    if not county:
+        return None
+
+    has_garnishment = any(
+        keyword_matches(keyword, text_lower, text_glued)
+        for keyword in GARNISHMENT_KEYWORDS
+    )
+
+    if not has_garnishment:
+        return None
+
+    return f"{OWEN_FOLDER}/{county}"
+
+
 # Create output folders for each document type
 
 def create_folders():
@@ -344,6 +407,13 @@ def create_folders():
     for doc_type in DOCUMENT_TYPES:
         folder_path = OUTPUT_FOLDER / doc_type
         folder_path.mkdir(parents=True, exist_ok=True)
+
+    # Owen folders - the Granted Motion garnishment exception, one
+    # sub-folder per qualifying county
+    for county in OWEN_COUNTIES:
+        (OUTPUT_FOLDER / OWEN_FOLDER / county).mkdir(
+            parents=True, exist_ok=True
+        )
 
     # Review folder
     review_folder = OUTPUT_FOLDER / "Review"
@@ -605,6 +675,18 @@ def classify_page(text):
         for keyword in keywords:
 
             if keyword_matches(keyword, text_lower, text_glued):
+
+                # The one Granted Motion that is kept instead of trashed -
+                # see the Owen Exception block above.
+                if doc_type == "Granted Motion":
+
+                    owen_folder = owen_exception_folder(
+                        text_lower, text_glued
+                    )
+
+                    if owen_folder:
+                        return owen_folder, keyword, False
+
                 return doc_type, keyword, True
 
     # Check normal documents SECOND
@@ -1722,6 +1804,9 @@ def main():
 
     document_counts["Review"] = 0
     document_counts[DUPLICATES_FOLDER] = 0
+
+    for county in OWEN_COUNTIES:
+        document_counts[f"{OWEN_FOLDER}/{county}"] = 0
 
     # CSV Report Data
 
