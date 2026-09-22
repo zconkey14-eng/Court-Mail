@@ -29,6 +29,12 @@ INPUT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Input")
 
 OUTPUT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Output")
 
+# Owen documents go to a different department, so they're written here
+# instead of under OUTPUT_FOLDER - a separate shared-drive location, split
+# into a sub-folder per county (see OWEN_COUNTIES below).
+# TODO: point this at the real shared-drive path for that department.
+OWEN_OUTPUT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Owen")
+
 
 # OCR Settings (AWS Textract)
 
@@ -408,12 +414,11 @@ def create_folders():
         folder_path = OUTPUT_FOLDER / doc_type
         folder_path.mkdir(parents=True, exist_ok=True)
 
-    # Owen folders - the Granted Motion garnishment exception, one
-    # sub-folder per qualifying county
+    # Owen folders - the Granted Motion garnishment exception. These go to
+    # a different department's own shared-drive location, not under
+    # OUTPUT_FOLDER, one sub-folder per qualifying county.
     for county in OWEN_COUNTIES:
-        (OUTPUT_FOLDER / OWEN_FOLDER / county).mkdir(
-            parents=True, exist_ok=True
-        )
+        (OWEN_OUTPUT_FOLDER / county).mkdir(parents=True, exist_ok=True)
 
     # Review folder
     review_folder = OUTPUT_FOLDER / "Review"
@@ -1202,6 +1207,12 @@ def save_page(
     elif is_trash:
         output_folder = OUTPUT_FOLDER / "Trash" / doc_type
 
+    # OWEN documents - a different department's own shared-drive location,
+    # not the regular Output tree. doc_type is "Owen/<county>".
+    elif doc_type.startswith(f"{OWEN_FOLDER}/"):
+        county = doc_type[len(OWEN_FOLDER) + 1:]
+        output_folder = OWEN_OUTPUT_FOLDER / county
+
     # Normal documents we want to keep
     else:
         output_folder = OUTPUT_FOLDER / doc_type
@@ -1766,6 +1777,7 @@ def main():
     print("Court Mail Sorter - OCR (AWS Textract)")
     print("=" * 60)
     print(f"Output goes to: {OUTPUT_FOLDER}")
+    print(f"Owen documents go to: {OWEN_OUTPUT_FOLDER}")
     print()
 
     textract_client = get_textract_client()
