@@ -1,7 +1,7 @@
 """Lifetime stats across every court mail report ever generated.
 
-Reads the "Court Mail Report" tab of every report*.xlsx in REPORT_FOLDER
-(the tab that lists every page) and totals them up: how many of each kept
+Reads the "Court Mail Report" tab of every report*.xlsx anywhere under
+REPORT_FOLDER, including the dated folders in "Past Weeks" (the tab that lists every page) and totals them up: how many of each kept
 document type, and the keep vs trash split overall.
 """
 
@@ -10,8 +10,9 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-# Where courtmail_aws.py writes report.xlsx, report_2.xlsx, ... (its
-# OUTPUT_FOLDER).
+# Top folder holding the reports. Each run's report sits in its own dated
+# folder here, and runs older than a week are in dated folders inside
+# "Past Weeks" - the search goes through every sub-folder, so both are found.
 REPORT_FOLDER = Path(r"F:\Legal\MD\Court Mail\Complete")
 
 MAIN_SHEET = "Court Mail Report"
@@ -84,7 +85,7 @@ def main():
     print(f"Reading reports from: {REPORT_FOLDER}")
 
     reports = sorted(
-        path for path in REPORT_FOLDER.glob("report*.xlsx")
+        path for path in REPORT_FOLDER.rglob("report*.xlsx")
         if not path.name.startswith("~$")
     )
 
